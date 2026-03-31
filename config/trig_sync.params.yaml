@@ -1,0 +1,11 @@
+ov9782_trig_sync:
+  ros__parameters:
+    lidar_topic: /unilidar/cloud
+    gpio_chip: /dev/gpiochip0
+    gpio_line: 0
+    pulse_width_us: 50
+    active_high: true
+    stats_period_s: 1.0
+    latency_window_size: 256
+    use_realtime: false
+    realtime_priority: 70
