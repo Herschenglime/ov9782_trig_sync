@@ -7,6 +7,7 @@ import Jetson.GPIO as GPIO
 import subprocess
 import time
 import threading
+from collections import deque
 
 class SyncCameraNode(Node):
     def __init__(self):
@@ -35,19 +36,38 @@ class SyncCameraNode(Node):
         # 4. Lock into External Trigger mode
         self.get_logger().info("Locking camera into External Trigger mode...")
         subprocess.run(['v4l2-ctl', '-d', '/dev/video0', '--set-ctrl=auto_exposure=1'])
-        subprocess.run(['v4l2-ctl', '-d', '/dev/video0', '--set-ctrl=exposure_time_absolute=100'])
+        subprocess.run(['v4l2-ctl', '-d', '/dev/video0', '--set-ctrl=exposure_time_absolute=50'])
         subprocess.run(['v4l2-ctl', '-d', '/dev/video0', '--set-ctrl=exposure_dynamic_framerate=1'])
         
         self.bridge = CvBridge()
         
         # 5. Setup Threading variables
         self.is_running = True
-        self.latest_trigger_time = None
+        self.max_pending_triggers = 32
+        self.pending_triggers = deque()
         self.trigger_lock = threading.Lock()
+        self.last_warn_time = 0.0
+
+        # Counters to monitor where rate mismatch occurs
+        self.lidar_count = 0
+        self.trigger_count = 0
+        self.frame_count = 0
+        self.publish_count = 0
+        self.read_fail_count = 0
+        self.stray_frame_count = 0
+        self.dropped_trigger_count = 0
+        self.bad_lidar_stamp_count = 0
+
+        # Previous counters used to compute per-second rates
+        self.prev_lidar_count = 0
+        self.prev_trigger_count = 0
+        self.prev_frame_count = 0
+        self.prev_publish_count = 0
         
         # 6. Setup ROS Publishers and Subscribers
         self.image_pub = self.create_publisher(Image, '/trig/image_raw', 10)
         self.lidar_sub = self.create_subscription(PointCloud2, '/unilidar/cloud', self.lidar_callback, 10)
+        self.stats_timer = self.create_timer(1.0, self.log_stats)
         
         # Start the background capture thread LAST so everything is ready
         self.capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
@@ -58,24 +78,36 @@ class SyncCameraNode(Node):
     def capture_loop(self):
         """Background thread that constantly waits for frames and publishes them."""
         while self.is_running and rclpy.ok():
-            # This fundamentally blocks until the triggered frame arrives from the USB bus
-            ret, frame = self.cap.read() 
-            
-            if ret:
-                # Safely grab the timestamp of the LiDAR message that triggered this frame
-                with self.trigger_lock:
-                    if self.latest_trigger_time is None:
-                        continue # Ignore stray frames before the first LiDAR msg arrives
-                    publish_time = self.latest_trigger_time
-                
-                # Convert and Publish immediately
-                img_msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
-                img_msg.header.stamp = publish_time
-                img_msg.header.frame_id = "camera_frame" 
-                
-                self.image_pub.publish(img_msg)
-            else:
-                self.get_logger().warn("OpenCV read failed or timed out internally!")
+            try:
+                # This fundamentally blocks until the triggered frame arrives from the USB bus
+                ret, frame = self.cap.read()
+
+                if ret:
+                    self.frame_count += 1
+
+                    # Pop exactly one trigger timestamp for exactly one captured frame.
+                    with self.trigger_lock:
+                        if not self.pending_triggers:
+                            self.stray_frame_count += 1
+                            continue
+                        publish_time = self.pending_triggers.popleft()
+
+                    # Convert and Publish immediately
+                    img_msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
+                    img_msg.header.stamp = publish_time
+                    img_msg.header.frame_id = "camera_frame"
+
+                    self.image_pub.publish(img_msg)
+                    self.publish_count += 1
+                else:
+                    self.read_fail_count += 1
+                    now = time.monotonic()
+                    if now - self.last_warn_time > 1.0:
+                        self.get_logger().warn("OpenCV read failed or timed out internally!")
+                        self.last_warn_time = now
+            except Exception as exc:
+                self.get_logger().error(f"capture_loop exception: {exc}")
+                time.sleep(0.01)
 
     def pulse_trigger(self):
         """1ms hardware pulse"""
@@ -84,15 +116,57 @@ class SyncCameraNode(Node):
         GPIO.output(self.trigger_pin, GPIO.LOW)
 
     def lidar_callback(self, lidar_msg):
-        # 1. Update the timestamp for the background thread to use
+        self.lidar_count += 1
+
+        stamp = lidar_msg.header.stamp
+        if stamp.sec == 0 and stamp.nanosec == 0:
+            self.bad_lidar_stamp_count += 1
+            stamp = self.get_clock().now().to_msg()
+
+        # Keep one timestamp entry per trigger so no LiDAR event is overwritten.
         with self.trigger_lock:
-            self.latest_trigger_time = self.get_clock().now().to_msg()
+            if len(self.pending_triggers) >= self.max_pending_triggers:
+                self.pending_triggers.popleft()
+                self.dropped_trigger_count += 1
+            self.pending_triggers.append(stamp)
             
-        # 2. Instantly fire the hardware trigger and EXIT the callback!
+        # Instantly fire the hardware trigger and exit the callback.
         self.pulse_trigger()
+        self.trigger_count += 1
+
+    def log_stats(self):
+        lidar_rate = self.lidar_count - self.prev_lidar_count
+        trigger_rate = self.trigger_count - self.prev_trigger_count
+        frame_rate = self.frame_count - self.prev_frame_count
+        publish_rate = self.publish_count - self.prev_publish_count
+
+        with self.trigger_lock:
+            pending = len(self.pending_triggers)
+
+        self.get_logger().info(
+            "rates Hz lidar=%d trigger=%d frame=%d publish=%d | pending=%d dropped_trigger=%d stray_frame=%d read_fail=%d bad_lidar_stamp=%d"
+            % (
+                lidar_rate,
+                trigger_rate,
+                frame_rate,
+                publish_rate,
+                pending,
+                self.dropped_trigger_count,
+                self.stray_frame_count,
+                self.read_fail_count,
+                self.bad_lidar_stamp_count,
+            )
+        )
+
+        self.prev_lidar_count = self.lidar_count
+        self.prev_trigger_count = self.trigger_count
+        self.prev_frame_count = self.frame_count
+        self.prev_publish_count = self.publish_count
 
     def destroy_node(self):
         self.is_running = False
+        if self.capture_thread.is_alive():
+            self.capture_thread.join(timeout=1.0)
         super().destroy_node()
 
 def main(args=None):
