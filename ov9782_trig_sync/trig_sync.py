@@ -1,17 +1,34 @@
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import PointCloud2, Image
+from sensor_msgs.msg import PointCloud2, Image, CameraInfo
 from cv_bridge import CvBridge
 import cv2
 import Jetson.GPIO as GPIO
 import subprocess
 import time
 import threading
+import copy
 from collections import deque
+from pathlib import Path
+
+import yaml
+from ament_index_python.packages import get_package_share_directory
 
 class SyncCameraNode(Node):
     def __init__(self):
         super().__init__('sync_camera_node')
+
+        default_info_path = (
+            Path(get_package_share_directory('ov9782_trig_sync'))
+            / 'config'
+            / 'ov9782_info.yaml'
+        )
+        self.declare_parameter('camera_info_path', str(default_info_path))
+        self.declare_parameter('camera_frame_id', 'camera_frame')
+        self.camera_frame_id = self.get_parameter('camera_frame_id').value
+        self.camera_info_template = self.load_camera_info(
+            self.get_parameter('camera_info_path').value
+        )
         
         # 1. Setup GPIO
         self.trigger_pin = 7
@@ -36,7 +53,7 @@ class SyncCameraNode(Node):
         # 4. Lock into External Trigger mode
         self.get_logger().info("Locking camera into External Trigger mode...")
         subprocess.run(['v4l2-ctl', '-d', '/dev/video0', '--set-ctrl=auto_exposure=1'])
-        subprocess.run(['v4l2-ctl', '-d', '/dev/video0', '--set-ctrl=exposure_time_absolute=50'])
+        subprocess.run(['v4l2-ctl', '-d', '/dev/video0', '--set-ctrl=exposure_time_absolute=10'])
         subprocess.run(['v4l2-ctl', '-d', '/dev/video0', '--set-ctrl=exposure_dynamic_framerate=1'])
         
         self.bridge = CvBridge()
@@ -66,6 +83,7 @@ class SyncCameraNode(Node):
         
         # 6. Setup ROS Publishers and Subscribers
         self.image_pub = self.create_publisher(Image, '/trig/image_raw', 10)
+        self.camera_info_pub = self.create_publisher(CameraInfo, '/trig/camera_info', 10)
         self.lidar_sub = self.create_subscription(PointCloud2, '/unilidar/cloud', self.lidar_callback, 10)
         self.stats_timer = self.create_timer(1.0, self.log_stats)
         
@@ -74,6 +92,42 @@ class SyncCameraNode(Node):
         self.capture_thread.start()
         
         self.get_logger().info("Node Ready. Waiting for point clouds...")
+
+    def load_camera_info(self, camera_info_path):
+        camera_info_msg = CameraInfo()
+        path = Path(camera_info_path)
+
+        if not path.is_file():
+            self.get_logger().warn(
+                f"Camera info file not found at '{path}'. Publishing default (empty) CameraInfo."
+            )
+            return camera_info_msg
+
+        try:
+            with path.open('r', encoding='utf-8') as stream:
+                data = yaml.safe_load(stream) or {}
+
+            camera_info_msg.width = int(data.get('image_width', 0))
+            camera_info_msg.height = int(data.get('image_height', 0))
+            camera_info_msg.distortion_model = str(data.get('distortion_model', ''))
+            camera_info_msg.d = [
+                float(value) for value in data.get('distortion_coefficients', {}).get('data', [])
+            ]
+            camera_info_msg.k = [float(value) for value in data.get('camera_matrix', {}).get('data', [0.0] * 9)]
+            camera_info_msg.r = [
+                float(value) for value in data.get('rectification_matrix', {}).get('data', [0.0] * 9)
+            ]
+            camera_info_msg.p = [
+                float(value) for value in data.get('projection_matrix', {}).get('data', [0.0] * 12)
+            ]
+
+            self.get_logger().info(f"Loaded CameraInfo from '{path}'")
+        except Exception as exc:
+            self.get_logger().error(
+                f"Failed to parse camera info yaml '{path}': {exc}. Publishing default (empty) CameraInfo."
+            )
+
+        return camera_info_msg
 
     def capture_loop(self):
         """Background thread that constantly waits for frames and publishes them."""
@@ -95,9 +149,15 @@ class SyncCameraNode(Node):
                     # Convert and Publish immediately
                     img_msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
                     img_msg.header.stamp = publish_time
-                    img_msg.header.frame_id = "camera_frame"
+                    img_msg.header.frame_id = self.camera_frame_id
 
                     self.image_pub.publish(img_msg)
+
+                    camera_info_msg = copy.deepcopy(self.camera_info_template)
+                    camera_info_msg.header.stamp = publish_time
+                    camera_info_msg.header.frame_id = self.camera_frame_id
+                    self.camera_info_pub.publish(camera_info_msg)
+
                     self.publish_count += 1
                 else:
                     self.read_fail_count += 1

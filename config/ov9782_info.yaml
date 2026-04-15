@@ -1,0 +1,26 @@
+image_width: 1280
+image_height: 800
+camera_name: ov9782
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [910.73645,   0.     , 659.26925,
+           0.     , 907.97468, 389.64584,
+           0.     ,   0.     ,   1.     ]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [0.032280, -0.038993, 0.000814, -0.000489, 0.000000]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1., 0., 0.,
+         0., 1., 0.,
+         0., 0., 1.]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [916.02649,   0.     , 658.22254,   0.     ,
+           0.     , 913.23145, 389.78069,   0.     ,
+           0.     ,   0.     ,   1.     ,   0.     ]
